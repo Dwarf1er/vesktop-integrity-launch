@@ -6,7 +6,6 @@
 <img alt="vesktop-integrity-launch logo" height="280" src="/assets/vesktop-integrity-launch-logo.webp" />
 
 ![License](https://img.shields.io/github/license/Dwarf1er/vesktop-integrity-launch?style=for-the-badge)
-![Version](https://img.shields.io/github/v/release/Dwarf1er/vesktop-integrity-launch?style=for-the-badge)
 ![Issues](https://img.shields.io/github/issues/Dwarf1er/vesktop-integrity-launch?style=for-the-badge)
 ![PRs](https://img.shields.io/github/issues-pr/Dwarf1er/vesktop-integrity-launch?style=for-the-badge)
 ![Contributors](https://img.shields.io/github/contributors/Dwarf1er/vesktop-integrity-launch?style=for-the-badge)
