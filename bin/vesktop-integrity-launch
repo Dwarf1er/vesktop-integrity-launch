@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+#
+# vesktop-integrity-launch (Linux & macOS)
+#
+# Wraps the real Vesktop binary. Before every launch it verifies the
+# Vencord files Vesktop loads (vencordDesktopMain.js, Preload.js,
+# Renderer.js, Renderer.css) against a locally recorded "known good"
+# baseline, and self-heals via `vesktop --repair` if they don't match.
+# See README.md for why the baseline is local rather than GitHub, and
+# for install instructions.
+
+set -u
+
+OS_NAME="$(uname -s)"
+
+case "$OS_NAME" in
+    Darwin) IS_MAC=1 ;;
+    *) IS_MAC=0 ;;
+esac
+
+# Locate the real Vesktop command.
+#
+# Resolution order:
+#   1. VESKTOP_BIN env var (explicit override)
+#   2. `vesktop` on PATH (native package installs: deb/rpm/AUR/brew-cask-with-cli)
+#   3. Flatpak (dev.vencord.Vesktop)
+#   4. macOS .app bundle in /Applications or ~/Applications
+VESKTOP_CMD=()
+FLATPAK_APP_ID="dev.vencord.Vesktop"
+
+resolve_vesktop_cmd() {
+    if [[ -n "${VESKTOP_BIN:-}" ]]; then
+        VESKTOP_CMD=("$VESKTOP_BIN")
+        return 0
+    fi
+
+    if command -v vesktop >/dev/null 2>&1; then
+        VESKTOP_CMD=("$(command -v vesktop)")
+        return 0
+    fi
+
+    if [[ "$IS_MAC" -eq 1 ]]; then
+        for candidate in "/Applications/Vesktop.app/Contents/MacOS/vesktop" \
+            "$HOME/Applications/Vesktop.app/Contents/MacOS/vesktop"; do
+            if [[ -x "$candidate" ]]; then
+                VESKTOP_CMD=("$candidate")
+                return 0
+            fi
+        done
+    fi
+
+    if command -v flatpak >/dev/null 2>&1 && flatpak info "$FLATPAK_APP_ID" >/dev/null 2>&1; then
+        VESKTOP_CMD=(flatpak run "$FLATPAK_APP_ID")
+        return 0
+    fi
+
+    return 1
+}
+
+if ! resolve_vesktop_cmd; then
+    echo "vesktop-integrity-launch: could not find Vesktop. Set VESKTOP_BIN to its path." >&2
+    exit 1
+fi
+
+# Locate the Vencord files directory. Mirrors Vesktop's own resolution
+# (electron app.getPath('userData')):
+#   - VENCORD_USER_DATA_DIR env override (Vesktop itself honors this)
+#   - Flatpak sandbox path
+#   - Linux:  ~/.config/vesktop
+#   - macOS:  ~/Library/Application Support/vesktop
+# then appends sessionData/vencordFiles.
+if [[ -n "${VENCORD_USER_DATA_DIR:-}" ]]; then
+    DATA_DIR="$VENCORD_USER_DATA_DIR"
+elif [[ "${VESKTOP_CMD[0]}" == "flatpak" ]]; then
+    DATA_DIR="$HOME/.var/app/$FLATPAK_APP_ID/config/vesktop"
+elif [[ "$IS_MAC" -eq 1 ]]; then
+    DATA_DIR="$HOME/Library/Application Support/vesktop"
+else
+    XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+    DATA_DIR="$XDG_CONFIG_HOME/vesktop"
+fi
+
+VENCORD_FILES_DIR="$DATA_DIR/sessionData/vencordFiles"
+
+FILES_TO_CHECK=(
+    vencordDesktopMain.js
+    vencordDesktopPreload.js
+    vencordDesktopRenderer.js
+    vencordDesktopRenderer.css
+)
+
+# Linux ships sha256sum (coreutils); macOS ships shasum.
+if command -v sha256sum >/dev/null 2>&1; then
+    hash_files() { sha256sum -- "$@"; }
+    check_files() { sha256sum -c --status -- "$1"; }
+elif command -v shasum >/dev/null 2>&1; then
+    hash_files() { shasum -a 256 -- "$@"; }
+    check_files() { shasum -a 256 -c --status -- "$1"; }
+else
+    echo "vesktop-integrity-launch: no sha256sum/shasum found, cannot verify integrity." >&2
+    exec "${VESKTOP_CMD[@]}" "$@"
+fi
+
+# Best-effort desktop notification: notify-send on Linux, osascript on macOS.
+notify() {
+    if [[ "$IS_MAC" -eq 1 ]]; then
+        osascript -e "display notification \"$1\" with title \"Vesktop\"" >/dev/null 2>&1
+    else
+        command -v notify-send >/dev/null 2>&1 && notify-send -a Vesktop "Vesktop" "$1" >/dev/null 2>&1
+    fi
+}
+
+if [[ "$IS_MAC" -eq 1 ]]; then
+    STATE_DIR="$HOME/Library/Caches/vesktop-integrity"
+else
+    XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache}"
+    STATE_DIR="$XDG_CACHE_HOME/vesktop-integrity"
+fi
+BASELINE_FILE="$STATE_DIR/baseline.sha256"
+LOG_FILE="$STATE_DIR/launch.log"
+LOCK_DIR="$STATE_DIR/lock"
+LOCK_STALE_SECS=300
+
+mkdir -p "$STATE_DIR"
+
+log() {
+    printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$1" >>"$LOG_FILE"
+}
+
+# Portable locking via mkdir (atomic on every POSIX filesystem, unlike
+# `flock` which isn't available on macOS by default).
+acquire_lock() {
+    local waited=0
+    while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+        if [[ -d "$LOCK_DIR" ]]; then
+            local age mtime
+            if [[ "$IS_MAC" -eq 1 ]]; then
+                mtime=$(stat -f %m "$LOCK_DIR" 2>/dev/null) || mtime=0
+            else
+                mtime=$(stat -c %Y "$LOCK_DIR" 2>/dev/null) || mtime=0
+            fi
+            age=$(( $(date +%s) - mtime ))
+            if [[ "$age" -gt "$LOCK_STALE_SECS" ]]; then
+                log "removing stale lock (age ${age}s)"
+                rmdir "$LOCK_DIR" 2>/dev/null
+                continue
+            fi
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        [[ "$waited" -ge 30 ]] && return 1
+    done
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+    return 0
+}
+
+write_baseline() {
+    local tmp f
+    for f in "${FILES_TO_CHECK[@]}"; do
+        [[ -f "$VENCORD_FILES_DIR/$f" ]] || return 1
+    done
+    tmp="$(mktemp "$STATE_DIR/baseline.XXXXXX")" || return 1
+    if ! (cd "$VENCORD_FILES_DIR" && hash_files "${FILES_TO_CHECK[@]}") >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$BASELINE_FILE"
+}
+
+check_baseline() {
+    [[ -f "$BASELINE_FILE" ]] || return 1
+    [[ -d "$VENCORD_FILES_DIR" ]] || return 1
+    (cd "$VENCORD_FILES_DIR" && check_files "$BASELINE_FILE") 2>/dev/null
+}
+
+run_repair() {
+    log "running: ${VESKTOP_CMD[*]} --repair"
+    "${VESKTOP_CMD[@]}" --repair >>"$LOG_FILE" 2>&1
+    log "repair exited with status $?"
+    if write_baseline; then
+        log "baseline updated after repair"
+        return 0
+    else
+        log "repair did not produce a complete, valid install; baseline left untouched"
+        return 1
+    fi
+}
+
+# The integrity check runs in a subshell so that any unexpected failure in
+# this logic (including a hard `set -u`/`set -e` abort) can never prevent
+# the real launch below: this script must never be the reason Vesktop
+# fails to start.
+(
+    VESKTOP_VERSION="$("${VESKTOP_CMD[@]}" --version 2>/dev/null)"
+    log "launch: ${VESKTOP_VERSION:-unknown version} (${VESKTOP_CMD[*]})"
+
+    if acquire_lock; then
+        if [[ ! -f "$BASELINE_FILE" ]]; then
+            log "no baseline found, establishing one via repair"
+            notify "Setting up Vesktop integrity monitoring..."
+            run_repair || notify "Vesktop repair failed to produce a complete install, launching anyway."
+        elif ! check_baseline; then
+            log "integrity check failed against baseline"
+            notify "Vesktop files look corrupted, repairing before launch..."
+            if run_repair; then
+                notify "Vesktop repaired successfully."
+            else
+                notify "Vesktop repair failed, launching existing (possibly broken) install."
+            fi
+        else
+            log "integrity check passed"
+        fi
+        rmdir "$LOCK_DIR" 2>/dev/null
+        trap - EXIT
+    else
+        log "lock timeout, launching without integrity check"
+    fi
+) 2>>"$LOG_FILE"
+
+exec "${VESKTOP_CMD[@]}" "$@"
