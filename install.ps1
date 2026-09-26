@@ -21,11 +21,22 @@
 
 $ErrorActionPreference = "Stop"
 
-$repoDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$srcScript = Join-Path $repoDir "bin\vesktop-integrity-launch.ps1"
+$rawBase = "https://raw.githubusercontent.com/Dwarf1er/vesktop-integrity-launch/main"
+
+$repoDir = if ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { $null }
+$srcScript = if ($repoDir) { Join-Path $repoDir "bin\vesktop-integrity-launch.ps1" } else { $null }
 
 $installDir = Join-Path $env:LOCALAPPDATA "VesktopIntegrityLauncher"
 $installPath = Join-Path $installDir "vesktop-integrity-launch.ps1"
+
+# Not run from inside a clone (piped straight from `irm | iex`, which has
+# no backing script file, or this file downloaded on its own): fetch the
+# launcher script itself instead.
+if (-not $srcScript -or -not (Test-Path $srcScript)) {
+    Write-Host "No local checkout found, fetching launcher script from GitHub..."
+    $srcScript = Join-Path ([System.IO.Path]::GetTempPath()) "vesktop-integrity-launch.ps1"
+    Invoke-WebRequest -Uri "$rawBase/bin/vesktop-integrity-launch.ps1" -OutFile $srcScript -UseBasicParsing
+}
 
 Write-Host "Installing vesktop-integrity-launch to $installPath"
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null

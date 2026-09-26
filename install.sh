@@ -7,12 +7,28 @@
 
 set -euo pipefail
 
+RAW_BASE="https://raw.githubusercontent.com/Dwarf1er/vesktop-integrity-launch/main"
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_SCRIPT="$REPO_DIR/bin/vesktop-integrity-launch"
 INSTALL_DIR="$HOME/.local/bin"
 INSTALL_PATH="$INSTALL_DIR/vesktop-integrity-launch"
 
 OS_NAME="$(uname -s)"
+
+TMP_SCRIPT=""
+cleanup() { [[ -n "$TMP_SCRIPT" ]] && rm -f "$TMP_SCRIPT"; }
+trap cleanup EXIT
+
+# Not run from inside a clone (piped straight from curl, or this file
+# downloaded on its own): $BASH_SOURCE[0] then resolves to somewhere
+# with no bin/ next to it, so fetch the launcher script itself instead.
+if [[ ! -f "$SRC_SCRIPT" ]]; then
+    echo "No local checkout found, fetching launcher script from GitHub..."
+    TMP_SCRIPT="$(mktemp)"
+    curl -fsSL "$RAW_BASE/bin/vesktop-integrity-launch" -o "$TMP_SCRIPT"
+    SRC_SCRIPT="$TMP_SCRIPT"
+fi
 
 echo "Installing vesktop-integrity-launch to $INSTALL_PATH"
 mkdir -p "$INSTALL_DIR"
